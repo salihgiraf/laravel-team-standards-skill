@@ -1,0 +1,221 @@
+---
+description: Laravel 11+ team coding standards — repository + service pattern, auto-binding, split routes by prefix, exceptions in bootstrap/app.php, naming conventions, and anti-patterns. Apply on every PHP and TSX file.
+globs:
+  - "**/*.php"
+  - "**/*.tsx"
+  - "**/*.ts"
+alwaysApply: true
+---
+
+# Laravel Team Coding Standards
+
+Stack: Laravel 11+, Inertia.js, React, TypeScript, Tailwind CSS v4, MySQL.
+
+## Request flow — never skip a layer
+
+```
+Route → FormRequest → Controller → Service → Repository → Model
+                          ↓
+                      Resource
+```
+
+| Layer | Does | Never does |
+|---|---|---|
+| Controller | Receives request, calls service, returns response | Runs queries, holds logic, validates inline |
+| Service | Business rules, transactions, events, jobs | Touches `Request`, writes queries |
+| Repository | All Eloquent / DB queries, eager loading | Decides business rules |
+| Resource | Shapes JSON / Inertia response | Fires queries (use `whenLoaded()`) |
+
+## Controller pattern
+
+Keep methods thin — 3 to 5 lines.
+
+```php
+public function store(StoreProductRequest $request): JsonResponse
+{
+    $product = $this->service->create($request->validated());
+
+    return $this->success(new ProductResource($product), 'Product created', 201);
+}
+```
+
+**Never:**
+- `Model::where()`, `Model::query()`, `DB::` in a controller
+- `$request->validate([...])` inline — use a FormRequest
+- Return raw model or array — use a Resource
+
+## Service pattern
+
+```php
+class ProductService
+{
+    public function __construct(
+        private readonly ProductRepositoryInterface $repository
+    ) {}
+
+    public function create(array $data): Product
+    {
+        return DB::transaction(function () use ($data) {
+            $product = $this->repository->create($data);
+            ProductCreated::dispatch($product);
+
+            return $product;
+        });
+    }
+}
+```
+
+- Inject the **interface**, not the concrete class.
+- Accept `array` (from `$request->validated()`), not the `Request` object.
+- Transactions here, events here, jobs here.
+
+## Repository + auto-binding
+
+- Extend `BaseRepository`. Implement `{Name}RepositoryInterface`.
+- All `with(...)` eager loading lives in the repository.
+- Never return a query builder — only Models, Collections, or Paginators.
+
+**Naming contract (required for auto-binding):**
+
+| Type | Namespace | Suffix |
+|---|---|---|
+| Interface | `App\Repositories\Interfaces` | `RepositoryInterface` |
+| Implementation | `App\Repositories\Eloquent` | `Repository` |
+
+`AppServiceProvider::register()` scans these and binds them automatically — don't write manual `bind()` calls.
+
+## Routes
+
+### Verbs
+
+- `PATCH` for edit-form updates (our default).
+- `POST` for non-CRUD actions / state changes.
+
+```
+POST  /orders/{order}/cancel        ✅  correct
+PATCH /orders/{order}               ❌  hides intent
+POST  /posts/{post}/publish         ✅  correct
+```
+
+### Paths
+
+- Plural, kebab-case: `/order-items`.
+- Route params match model name: `{product}`, not `{id}`.
+- Dot-notation names: `products.index`, `admin.products.update`.
+- Nest at most one level.
+
+### Split files by URL prefix
+
+```
+routes/
+├── web.php                    ← thin loader
+├── api.php                    ← mounts v1
+├── web/
+│   ├── products.php           ← /products/*
+│   └── admin.php              ← /admin/*
+└── api/v1/
+    ├── auth.php
+    └── products.php
+```
+
+Thin loader applies `prefix`, `as`, and middleware at `require`:
+
+```php
+// routes/web.php
+Route::middleware(['auth', 'verified'])->group(function () {
+    require __DIR__ . '/web/products.php';
+});
+```
+
+```php
+// routes/web/products.php
+Route::prefix('products')->as('products.')->group(function () {
+    Route::get('/', [ProductController::class, 'index'])->name('index');
+    Route::post('/', [ProductController::class, 'store'])->name('store');
+    Route::patch('/{product}', [ProductController::class, 'update'])->name('update');
+    Route::delete('/{product}', [ProductController::class, 'destroy'])->name('destroy');
+});
+```
+
+## Exception handling
+
+Laravel 11+: all exception handling lives in `bootstrap/app.php` via `->withExceptions()`. Do not recreate `app/Exceptions/Handler.php`. Do not add `try/catch` in controllers just to change the response.
+
+- Services and repositories `throw`. Controllers don't catch.
+- Every domain exception extends `App\Exceptions\BusinessException`.
+- Never `throw new \Exception('...')` in feature code.
+
+```php
+// app/Exceptions/BusinessException.php
+class BusinessException extends Exception
+{
+    public function __construct(string $message = '', int $code = 400)
+    {
+        parent::__construct($message, $code);
+    }
+}
+```
+
+```php
+// In a service
+if ($product->stock < $quantity) {
+    throw new ProductOutOfStockException($product->sku);
+}
+```
+
+All API errors use the same envelope:
+
+```json
+{ "success": false, "message": "...", "errors": { } }
+```
+
+## Naming
+
+| Thing | Rule | Example |
+|---|---|---|
+| Controllers | Singular + `Controller` | `ProductController` |
+| Models | Singular PascalCase | `OrderItem` |
+| Tables | Plural snake_case | `order_items` |
+| Foreign keys | `{model}_id` | `user_id` |
+| FormRequests | Action + Model + `Request` | `StoreProductRequest` |
+| Resources | Model + `Resource` | `ProductResource` |
+| Services | Model + `Service` | `ProductService` |
+| Repositories | Model + `Repository` / `Interface` | `ProductRepository` |
+| URIs | Plural kebab-case | `/order-items` |
+| Route names | Dot notation | `products.index` |
+| Booleans | `is / has / can` prefix | `is_published` |
+| Events | Past tense | `ProductCreated` |
+| Jobs | Imperative | `SendInvoiceEmail` |
+
+## PHP style
+
+- PSR-12, PHP 8.3+, `declare(strict_types=1);` on new files.
+- Type everything (params, return, properties).
+- Constructor property promotion, `readonly`, enums, match.
+- Never call `env()` outside `config/*`.
+- Run `./vendor/bin/pint` before committing.
+
+## Frontend (Inertia + React + Tailwind v4)
+
+- TypeScript everywhere. Shared types in `resources/js/types/index.ts`.
+- Pages: `resources/js/Pages/{Module}/{Index,Create,Edit,Show}.tsx`.
+- Use `useForm`, `Link`, `router` from `@inertiajs/react` — never hand-rolled `fetch` for Inertia navigation.
+- Tailwind v4 is CSS-first: tokens in `resources/css/app.css` under `@theme { }`.
+- Extract a component when the same utility string appears 3+ times.
+- Use `cn()` / `clsx` for conditional classes.
+
+## N+1 prevention
+
+Add a relation field to a Resource → update the repository's eager loads in the same commit. Resources use `whenLoaded()` so a missing eager load surfaces as missing data (not a silent N+1).
+
+## Anti-patterns — reject these in reviews
+
+- `Model::where(...)` in a controller or service
+- Inline `$request->validate([...])`
+- Returning a raw model or array from a controller
+- Services type-hinting concrete repositories instead of interfaces
+- Eager loads in the controller
+- Business logic inside a FormRequest or Resource
+- `env()` outside `config/*`
+- Recreating `app/Exceptions/Handler.php`
+- `try/catch` in a controller to reshape responses
